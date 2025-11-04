@@ -1,21 +1,49 @@
-import os, re, time, tempfile
+import os, re, io, time, tempfile, json
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
 
 import requests
 import pandas as pd
 import streamlit as st
+from bs4 import BeautifulSoup
+from openai import OpenAI
 
-# =========================
+# =========================================
 # Streamlit page
-# =========================
-st.set_page_config(page_title="BSE — Company Update (Tabular Feed)", layout="wide")
-st.title("📑 BSE — Company Update (Tabular Feed)")
-st.caption("Lists all 'Company Update' announcements in a table (no summarization). Includes best-effort mapping to SEBI regulations.")
+# =========================================
+st.set_page_config(page_title="BSE — Company Update (PDF-aware tags)", layout="wide")
+st.title("📑 BSE — Company Update (PDF-aware Announcement Type & Regulation)")
+st.caption("Robustly resolves each PDF (HTML parse + OpenAI pick), then extracts Announcement Type & cited Regulations from the PDF. No summaries.")
 
-# =========================
+# =========================================
+# OpenAI client
+# =========================================
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+if not api_key:
+    st.error("Missing OPENAI_API_KEY (set env var or add to Streamlit secrets).")
+    st.stop()
+
+@st.cache_resource(show_spinner=False)
+def _get_client(_api_key: str):
+    return OpenAI(api_key=_api_key)
+
+client = _get_client(api_key)
+
+with st.expander("🔍 OpenAI connection diagnostics", expanded=False):
+    key_src = "st.secrets" if "OPENAI_API_KEY" in st.secrets else "env"
+    mask = lambda s: (s[:7] + "..." + s[-4:]) if s and len(s) > 12 else "unset"
+    st.write("Key source:", key_src)
+    st.write("API key (masked):", mask(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")))
+    try:
+        _ = client.models.list()
+        st.success("Models list ok — auth looks good.")
+    except Exception as e:
+        st.error(f"Models list failed: {e}")
+
+# =========================================
 # Small utilities
-# =========================
+# =========================================
 _ILLEGAL_RX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 def _clean(s: str) -> str:
     return _ILLEGAL_RX.sub('', s) if isinstance(s, str) else s
@@ -29,14 +57,54 @@ def _first_col(df: pd.DataFrame, names):
 def _norm(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
-def _slug(s: str, maxlen: int = 60) -> str:
-    s = re.sub(r"[^A-Za-z0-9]+", "_", str(s or "")).strip("_")
-    return (s[:maxlen] if len(s) > maxlen else s) or "file"
-
 def _fmt(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
 
-def _candidate_urls(row):
+# ---------- HTTP helpers ----------
+def _session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
+    return s
+
+def _head_ok_pdf(url, timeout=20) -> bool:
+    try:
+        r = _session().head(url, timeout=timeout, allow_redirects=True)
+        if r.status_code == 200:
+            if url.lower().endswith(".pdf"):
+                return True
+            if "pdf" in (r.headers.get("content-type","").lower()):
+                return True
+    except Exception:
+        pass
+    return False
+
+def _download_pdf(url: str, timeout=25) -> bytes:
+    s = _session()
+    s.headers.update({
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Referer": "https://www.bseindia.com/corporates/ann.html",
+    })
+    r = s.get(url, timeout=timeout, allow_redirects=True, stream=False)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.content
+
+def _fetch_html(url: str, timeout=25) -> str:
+    try:
+        r = _session().get(url, timeout=timeout, allow_redirects=True)
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type","").lower():
+            return r.text
+    except Exception:
+        pass
+    return ""
+
+# ---------- Candidate link builders ----------
+def _candidate_urls_from_row(row):
     cands = []
     att = str(row.get("ATTACHMENTNAME") or "").strip()
     if att:
@@ -46,61 +114,97 @@ def _candidate_urls(row):
             f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att}",
         ]
     ns = str(row.get("NSURL") or "").strip()
-    if ".pdf" in ns.lower():
-        cands.append(ns if ns.lower().startswith("http") else "https://www.bseindia.com/" + ns.lstrip("/"))
+    if ns:
+        if ns.lower().startswith("http"):
+            cands.append(ns)
+        else:
+            cands.append("https://www.bseindia.com/" + ns.lstrip("/"))
+    # dedupe
     seen, out = set(), []
     for u in cands:
         if u and u not in seen:
             out.append(u); seen.add(u)
     return out
 
-def _download_head_pdf_url(urls, timeout=20):
-    """Return first PDF URL that responds with HTTP 200 and looks like a PDF (lightweight check)."""
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/pdf,application/octet-stream,*/*",
-        "Referer": "https://www.bseindia.com/corporates/ann.html",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    for u in urls:
-        try:
-            r = s.head(u, timeout=timeout, allow_redirects=True)
-            if r.status_code == 200:
-                # Some BSE servers don't send content-type reliably; accept .pdf extension or 200 OK
-                if u.lower().endswith(".pdf") or "pdf" in (r.headers.get("content-type","").lower()):
-                    return u
-        except Exception:
+def _parse_pdf_links_from_html(html: str, base_url: str) -> list[str]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href: 
             continue
-    return ""
+        abs_url = urljoin(base_url, href)
+        if ".pdf" in abs_url.lower():
+            links.append(abs_url)
+    # also check <embed> and <iframe>
+    for tag in soup.find_all(["embed", "iframe"]):
+        src = tag.get("src")
+        if not src: 
+            continue
+        abs_url = urljoin(base_url, src)
+        if ".pdf" in abs_url.lower():
+            links.append(abs_url)
+    # dedupe
+    out, seen = [], set()
+    for u in links:
+        if u not in seen:
+            out.append(u); seen.add(u)
+    return out
 
-# =========================
-# BSE fetch — STRICT base
-# =========================
+# ---------- OpenAI-assisted PDF link picker ----------
+PDF_LINK_PICKER_PROMPT = """You are resolving a BSE announcement's correct PDF link.
+You will be given:
+1) A list of candidate URLs (some may be HTML, redirects, or wrong folders)
+2) A fragment of the announcement HTML page (if available)
+
+Task:
+- Choose ONE most likely valid PDF URL for the actual filing.
+- Prefer URLs ending in .pdf or with 'xml-data/corpfiling/' paths (Attach/AttachLive/AttachHis).
+- If multiple PDFs exist, pick the primary filing (not 'newspaper advertisement' unless it's the only PDF).
+- Return STRICT JSON: {"best_pdf_url": "<url or empty string if none>"}
+No extra text, no explanations.
+"""
+
+def _openai_pick_best_pdf(candidates: list[str], html_snippet: str, model="gpt-4.1-mini") -> str:
+    # Lightweight guard to avoid sending huge HTML
+    html_short = html_snippet[:12000] if html_snippet and len(html_snippet) > 12000 else (html_snippet or "")
+    payload = {
+        "candidates": candidates,
+        "html_excerpt": html_short,
+    }
+    resp = client.responses.create(
+        model=model,
+        temperature=0.0,
+        max_output_tokens=200,
+        input=[{
+            "role": "system",
+            "content": [{"type": "input_text", "text": PDF_LINK_PICKER_PROMPT}]
+        },{
+            "role": "user",
+            "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]
+        }]
+    )
+    txt = (resp.output_text or "").strip()
+    try:
+        data = json.loads(txt)
+        url = data.get("best_pdf_url","").strip()
+        return url
+    except Exception:
+        return ""
+
+# =========================================
+# BSE fetch (no subcategory filter here)
+# =========================================
+@st.cache_data(show_spinner=False)
 def fetch_bse_announcements(start_yyyymmdd: str,
                             end_yyyymmdd: str,
-                            verbose: bool = False,
                             request_timeout: int = 25) -> pd.DataFrame:
-    """
-    Fetches raw announcements for the given date range.
-    We will later filter to Category='Company Update' ONLY (no subcategory filter).
-    """
-    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
-    assert start_yyyymmdd <= end_yyyymmdd
     base_page = "https://www.bseindia.com/corporates/ann.html"
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": base_page,
-        "X-Requested-With": "XMLHttpRequest",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
-
+    s = _session()
     try:
         s.get(base_page, timeout=15)
     except Exception:
@@ -123,10 +227,7 @@ def fetch_bse_announcements(start_yyyymmdd: str,
         rows, total, page = [], None, 1
         while True:
             r = s.get(url, params=params, timeout=request_timeout)
-            ct = r.headers.get("content-type","")
-            if "application/json" not in ct:
-                if verbose:
-                    st.warning(f"[variant {v}] non-JSON on page {page} (ct={ct}).")
+            if "application/json" not in r.headers.get("content-type",""):
                 break
             data = r.json()
             table = data.get("Table") or []
@@ -163,61 +264,101 @@ def filter_company_update_only(df_in: pd.DataFrame, category_filter="Company Upd
     df2["_cat_norm"] = df2[cat_col].map(lambda x: _norm(x).lower())
     return df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
 
-# =========================
-# Regulation inference
-# =========================
-# Best-effort mapping using headline/subcategory heuristics.
-# Note: BSE text is noisy; we map the common cases conservatively.
-_RULES = [
-    (r"(record date|book closure)", "Reg 42 (Record Date/Book Closure)"),
-    (r"(dividend|interim dividend|final dividend)", "Reg 30/42 (Dividend / Corporate Action)"),
-    (r"(board meeting outcome|outcome of board meeting|bm outcome)", "Reg 30 (Outcome of Board Meeting)"),
-    (r"(intimation of board meeting|board meeting intimation)", "Reg 29 (Board Meeting Intimation)"),
-    (r"(analyst|investor)\s+(meet|call|presentation)", "Reg 30 & Reg 46 (Analyst/Investor Meet/Presentation)"),
-    (r"(press release|media release|newspaper|publication)", "Reg 30 (Press/Media)"),
-    (r"(credit rating|reaffirmed rating|rating update)", "Reg 30 (Credit Rating)"),
-    (r"(agm|egm|postal ballot)", "Reg 30 & Reg 44 (Shareholder Meeting)"),
-    (r"(appointment|resignation).*(director|cfo|cs|ceo|kmp)", "Reg 30 (KMP/Director changes; Sch III Part A)"),
-    (r"(preferential issue|qip|private placement|allotment of shares|warrants)", "Reg 30 (Capital Raise)"),
-    (r"(buyback)", "SEBI Buyback Regulations & Reg 30"),
-    (r"(esop|stock option|rsu|grant)", "SEBI SBEB Regs & Reg 30"),
-    (r"(pledge|encumbrance|release of pledge)", "Reg 31 & Reg 30 (Encumbrance)"),
-    (r"(acquisition|amalgamation|merger|scheme of arrangement|demerger|slump sale|joint venture)", "Reg 30 (M&A / Scheme; Sch III)"),
-    (r"(trading window closure|window closure)", "SEBI (PIT) Regulations"),
-    (r"(related party|rpt)", "Reg 23 & Reg 30 (RPT)"),
-    (r"(change in statutory auditor|auditor resignation|auditor appointment)", "Reg 30 (Auditors)"),
-    (r"(intimation.*record date)", "Reg 42 (Record Date)"),
-]
+# =========================================
+# OpenAI: extract announcement type & regulations from PDF
+# =========================================
+PDF_EXTRACTION_SYSTEM = """You are a meticulous compliance analyst for Indian listed company filings.
+Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
+{
+  "announcement_type_from_pdf": "<short type name from the filing or obvious from its contents>",
+  "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
+}
+Rules:
+- Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
+  'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
+- If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
+- If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
+- Output ONLY the JSON, no prose.
+"""
 
-def infer_regulation(headline: str, subcategory: str) -> str:
-    text = f"{headline or ''} {subcategory or ''}".lower()
-    for rx, label in _RULES:
-        if re.search(rx, text):
-            return label
-    # If the exchange itself says "Disclosure under Reg 30"
-    if "reg 30" in text or "regulation 30" in text:
-        return "Reg 30 (Disclosure)"
-    return "Reg (best-effort not obvious)"
+def openai_extract_from_pdf(pdf_bytes: bytes, model: str = "gpt-4.1-mini", max_output_tokens: int = 200) -> dict:
+    # Upload file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        uploaded = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
 
-# =========================
+    # Ask the model to return STRICT JSON
+    resp = client.responses.create(
+        model=model,
+        max_output_tokens=max_output_tokens,
+        temperature=0.0,
+        input=[{
+            "role": "system",
+            "content": [{"type": "input_text", "text": PDF_EXTRACTION_SYSTEM}]
+        },{
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": uploaded.id}]
+        }],
+    )
+    raw = (resp.output_text or "").strip()
+    # Best-effort robust JSON parse
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict): raise ValueError("not dict")
+        # Normalize
+        t = data.get("announcement_type_from_pdf") or ""
+        regs = data.get("regulations_cited") or []
+        if isinstance(regs, str): regs = [regs]
+        regs = [r.strip() for r in regs if str(r).strip()]
+        if not regs: regs = ["Not disclosed"]
+        return {
+            "announcement_type_from_pdf": t.strip() or "Not disclosed",
+            "regulations_cited": list(dict.fromkeys(regs))  # de-dup preserve order
+        }
+    except Exception:
+        return {
+            "announcement_type_from_pdf": "Not disclosed",
+            "regulations_cited": ["Not disclosed"]
+        }
+
+def format_reg_list(regs: list[str]) -> str:
+    if not regs: return "Not disclosed"
+    uniq, seen = [], set()
+    for r in regs:
+        k = r.lower().strip()
+        if k not in seen:
+            seen.add(k); uniq.append(r)
+    return "; ".join(uniq)
+
+# =========================================
 # Sidebar controls
-# =========================
+# =========================================
 with st.sidebar:
     st.header("⚙️ Controls")
     today = datetime.now().date()
     start_date = st.date_input("Start date", value=today - timedelta(days=1), max_value=today)
     end_date   = st.date_input("End date", value=today, max_value=today, min_value=start_date)
-    max_items  = st.slider("Max announcements to fetch", 20, 1000, 200, step=20)
-    run        = st.button("🚀 Fetch Company Update")
 
-# =========================
+    model = st.selectbox(
+        "OpenAI model",
+        ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"],
+        index=0,
+        help="Models with file-reading capability. 4.1-mini/4o-mini are cost-efficient."
+    )
+    max_items  = st.slider("Max announcements to process", 10, 250, 60, step=10)
+    max_workers = st.slider("Parallel PDF reads", 1, 6, 3, help="Lower if you hit 429s.")
+    show_inline_pdf = st.toggle("Show inline PDF preview (first 1 MiB)", value=False)
+    run = st.button("🚀 Fetch & Extract from PDFs", type="primary")
+
+# =========================================
 # Run
-# =========================
+# =========================================
 if run:
     start_str, end_str = _fmt(start_date), _fmt(end_date)
 
     with st.status("Fetching announcements…", expanded=True):
-        df_raw = fetch_bse_announcements(start_str, end_str, verbose=False)
+        df_raw = fetch_bse_announcements(start_str, end_str)
         st.write(f"Raw rows fetched: **{len(df_raw)}**")
         df_hits = filter_company_update_only(df_raw, category_filter="Company Update")
         st.write(f"'Company Update' rows: **{len(df_hits)}**")
@@ -229,49 +370,164 @@ if run:
     if len(df_hits) > max_items:
         df_hits = df_hits.head(max_items)
 
-    # Identify common columns
+    # Identify columns
     nm_col   = _first_col(df_hits, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
     sub_col  = _first_col(df_hits, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY"]) or "SUBCATEGORYNAME"
     date_col = _first_col(df_hits, ["NEWS_DT","DT","NEWSDATE","NEWS_DATE"]) or "NEWS_DT"
     head_col = _first_col(df_hits, ["HEADLINE","NEWS_SUB","SUBJECT","HEADING"]) or "HEADLINE"
+    ns_col   = _first_col(df_hits, ["NSURL","NEWS_URL","LINK"]) or "NSURL"  # sometimes useful to fetch HTML
 
-    # Build rows with PDF URL and inferred regulation
-    out_rows = []
-    with st.status("Building table…", expanded=False):
-        for _, r in df_hits.iterrows():
-            company   = _clean(str(r.get(nm_col) or "").strip())
-            dt_raw    = str(r.get(date_col) or "").strip()
-            headline  = _clean(str(r.get(head_col) or "").strip())
-            subcat    = _clean(str(r.get(sub_col) or "").strip())
+    rows = df_hits.to_dict(orient="records")
 
-            # Date formatting (leave as-is if unknown)
-            dt_show = dt_raw
-            # Some feeds give "DD MMM YYYY HH:MM", others "YYYY-MM-DD", we'll not over-parse to avoid errors.
+    st.subheader("📄 Resolving PDFs & Processing with OpenAI")
+    progress = st.progress(0)
 
-            urls = _candidate_urls(r)
-            pdf_url = _download_head_pdf_url(urls) if urls else ""
+    def resolve_pdf_url(row) -> tuple[str, str]:
+        """
+        Returns (pdf_url, html_excerpt_used)
+        Strategy:
+          1) Try attachment/NSURL candidates that are already PDFs
+          2) If none work, fetch the announcement HTML (NSURL) and parse all .pdf hrefs
+          3) Ask OpenAI to pick best from all candidates + HTML
+        """
+        candidates = _candidate_urls_from_row(row)
+        # Quick direct hits
+        for u in candidates:
+            if _head_ok_pdf(u):
+                return u, ""
 
-            reg_guess = infer_regulation(headline, subcat)
+        # If NSURL looks like HTML, parse it for PDFs
+        nsurl = str(row.get(ns_col) or "").strip()
+        if nsurl and not nsurl.lower().endswith(".pdf"):
+            nsurl_abs = nsurl if nsurl.lower().startswith("http") else ("https://www.bseindia.com/" + nsurl.lstrip("/"))
+            html = _fetch_html(nsurl_abs)
+            if html:
+                parsed = _parse_pdf_links_from_html(html, nsurl_abs)
+                # Add parsed to candidate pool
+                for p in parsed:
+                    if p not in candidates:
+                        candidates.append(p)
+                # Try HEAD again on parsed
+                for p in parsed:
+                    if _head_ok_pdf(p):
+                        return p, html
 
-            out_rows.append({
+                # Let OpenAI choose the best if still ambiguous
+                chosen = _openai_pick_best_pdf(candidates, html, model=model)
+                if chosen and _head_ok_pdf(chosen):
+                    return chosen, html
+                # last gasp: just return chosen even if HEAD fails (some servers block HEAD)
+                if chosen:
+                    return chosen, html
+
+        # No HTML or still unresolved — ask OpenAI to pick from candidates
+        chosen = _openai_pick_best_pdf(candidates, "", model=model)
+        if chosen and ( _head_ok_pdf(chosen) or chosen.lower().endswith(".pdf") ):
+            return chosen, ""
+
+        # give up
+        return "", ""
+
+    def worker(row):
+        pdf_url, html_used = resolve_pdf_url(row)
+        if not pdf_url:
+            return row, pdf_url, None, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
+
+        pdf_bytes = None
+        try:
+            pdf_bytes = _download_pdf(pdf_url, timeout=30)
+        except Exception:
+            # sometimes servers block GET with certain headers; try once more with a simple session
+            try:
+                pdf_bytes = requests.get(pdf_url, timeout=30).content
+            except Exception:
+                pdf_bytes = None
+
+        if not pdf_bytes or len(pdf_bytes) < 500:
+            return row, pdf_url, None, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
+
+        info = openai_extract_from_pdf(pdf_bytes, model=model, max_output_tokens=220)
+        return row, pdf_url, pdf_bytes, info
+
+    out = []
+    dl_bins = []  # store tuples (filename, bytes) for download buttons
+    total = len(rows)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(worker, r) for r in rows]
+        for fut in as_completed(futs):
+            row, pdf_url, pdf_bytes, info = fut.result()
+            company   = _clean(str(row.get(nm_col) or "").strip())
+            dt_show   = str(row.get(date_col) or "").strip()
+            headline  = _clean(str(row.get(head_col) or "").strip())
+            subcat    = _clean(str(row.get(sub_col) or "").strip())
+            regs_str  = format_reg_list(info.get("regulations_cited") or [])
+
+            # build filename for download
+            safe_comp = re.sub(r"[^A-Za-z0-9]+", "_", company).strip("_") or "Company"
+            safe_date = re.sub(r"[^0-9A-Za-z:_-]+", "_", dt_show) or "Date"
+            filename = f"{safe_comp}_{safe_date}.pdf"
+
+            if pdf_bytes:
+                dl_bins.append((f"{filename}", pdf_bytes))
+
+            out.append({
                 "Company": company,
                 "Date": dt_show,
                 "Headline": headline,
-                "Announcement Type": subcat or "NA",
-                "Interpreted Regulation (best-effort)": reg_guess,
-                "PDF Link": pdf_url
+                "Announcement Type (BSE subcategory)": subcat or "NA",
+                "Interpreted Regulation (from PDF)": regs_str,
+                "PDF Link": pdf_url if pdf_url else ""
             })
+            done += 1
+            progress.progress(min(1.0, done/total))
 
-    df_out = pd.DataFrame(out_rows, columns=[
-        "Company","Date","Headline","Announcement Type","Interpreted Regulation (best-effort)","PDF Link"
+    # Final table
+    df_out = pd.DataFrame(out, columns=[
+        "Company","Date","Headline","Announcement Type (BSE subcategory)","Interpreted Regulation (from PDF)","PDF Link"
     ])
 
-    st.subheader("📋 Company Update — Tabular View")
-    st.dataframe(df_out, use_container_width=True)
+    st.subheader("📋 Company Update — PDF-aware Tabular View")
+    st.dataframe(df_out.drop(columns=["PDF Link"]), use_container_width=True)
 
-    # CSV download
+    # PDF Links + inline preview + per-file download
+    with st.expander("🔗 Open / Download PDFs", expanded=False):
+        for i, r in df_out.iterrows():
+            if r["PDF Link"]:
+                st.markdown(f"**{r['Company']} — {r['Date']}**")
+                st.markdown(f"[Open PDF]({r['PDF Link']})  \n`{r['Headline']}`")
+                # Provide a matching download if we captured bytes
+                if i < len(dl_bins):
+                    fname, data = dl_bins[i]
+                    st.download_button(
+                        label=f"⬇️ Download: {fname}",
+                        data=data,
+                        file_name=fname,
+                        mime="application/pdf",
+                        key=f"dl_{i}"
+                    )
+                    if show_inline_pdf:
+                        # show a tiny inline preview without external viewers
+                        try:
+                            import base64
+                            b64 = base64.b64encode(data[:1_000_000]).decode("ascii")  # preview up to ~1 MiB
+                            st.markdown(
+                                f'<embed src="data:application/pdf;base64,{b64}" type="application/pdf" width="100%" height="500px" />',
+                                unsafe_allow_html=True
+                            )
+                        except Exception:
+                            pass
+                st.markdown("---")
+
+    # CSV download (includes PDF Link)
     csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=f"bse_company_update_{start_str}_{end_str}.csv", mime="text/csv")
+    st.download_button(
+        "⬇️ Download CSV (with PDF links)",
+        data=csv_bytes,
+        file_name=f"bse_company_update_pdf_tags_{start_str}_{end_str}.csv",
+        mime="text/csv"
+    )
 
 else:
-    st.info("Pick your date range and click **Fetch Company Update** to see the table.")
+    st.info("Pick your date range and click **Fetch & Extract from PDFs** to build the table.")
