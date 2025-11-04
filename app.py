@@ -199,7 +199,6 @@ Rules:
 - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
   'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
 - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
-- If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
 - Output ONLY the JSON, no prose.
 """
 
