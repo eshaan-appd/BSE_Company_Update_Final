@@ -222,7 +222,10 @@ def openai_extract_from_pdf(pdf_bytes: bytes, model: str = "gpt-4.1-mini", max_o
             "content": [{"type": "input_file", "file_id": uploaded.id}]
         }],
     )
+
+
     raw = (resp.output_text or "").strip()
+    st.debug(f"RAW OpenAI JSON: {raw}")   # right after resp
     # Best-effort robust JSON parse
     try:
         data = json.loads(raw)
