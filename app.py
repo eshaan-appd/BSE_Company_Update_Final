@@ -323,34 +323,33 @@ if run:
     done = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(worker, r) for r in rows]
-        for fut in as_completed(futs):
-            row, pdf_url, info = fut.result()
-    
-            company  = _clean(str(row.get(nm_col) or "").strip())
-            dt_show  = str(row.get(date_col) or "").strip()
-            headline = _clean(str(row.get(head_col) or "").strip())
-    
-            # ⬇️ pull both fields from the OpenAI JSON `info`
-            ann_type_from_pdf = (info.get("announcement_type_from_pdf") or "Not disclosed").strip()
-            regs_str          = format_reg_list(info.get("regulations_cited") or [])
-    
-            out.append({
-                "Company": company,
-                "Date": dt_show,
-                "Headline": headline,
-                "Announcement Type (from PDF)": ann_type_from_pdf,
-                "Interpreted Regulation (from PDF)": regs_str,
-                "PDF Link": pdf_url if pdf_url else ""
-            })
-    
-            done += 1
-            progress.progress(min(1.0, done/total))
+    futs = [ex.submit(worker, r) for r in rows]
+    for fut in as_completed(futs):
+        row, pdf_url, info = fut.result()
+
+        company  = _clean(str(row.get(nm_col) or "").strip())
+        dt_show  = str(row.get(date_col) or "").strip()
+        headline = _clean(str(row.get(head_col) or "").strip())
+
+        # ⬇️ NO processing: copy OpenAI fields exactly as returned
+        ann_type_from_pdf = info.get("announcement_type_from_pdf")
+        regs_from_pdf     = info.get("regulations_cited")
+
+        out.append({
+            "Company": company,
+            "Date": dt_show,
+            "Headline": headline,
+            "Announcement Type": ann_type_from_pdf,          # exact value from OpenAI
+            "Interpreted Regulation": regs_from_pdf,         # exact value from OpenAI (likely a list)
+            "PDF Link": pdf_url if pdf_url else ""
+        })
+
+        done += 1
+        progress.progress(min(1.0, done/total))
 
     # Sort by Date (fallback to as-is if parsing fails)
     df_out = pd.DataFrame(out, columns=[
-        "Company","Date","Headline","Announcement Type (BSE subcategory)","Interpreted Regulation (from PDF)","PDF Link"
-    ])
+    "Company","Date","Headline","Announcement Type (BSE subcategory)","Interpreted Regulation (from PDF)","PDF Link"])
 
     st.subheader("📋 Company Update — PDF-aware Tabular View")
     st.dataframe(df_out.drop(columns=["PDF Link"]), use_container_width=True)
