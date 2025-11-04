@@ -1,47 +1,21 @@
-import os, re, io, time, tempfile, json
+import os, re, time, tempfile
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
 
-# =========================================
+# =========================
 # Streamlit page
-# =========================================
-st.set_page_config(page_title="BSE — Company Update (PDF-aware tags)", layout="wide")
-st.title("📑 BSE — Company Update (PDF-aware Announcement Type & Regulation)")
-st.caption("Reads each PDF with OpenAI to extract Announcement Type (from PDF text) and cited Regulations. No summaries.")
+# =========================
+st.set_page_config(page_title="BSE — Company Update (Tabular Feed)", layout="wide")
+st.title("📑 BSE — Company Update (Tabular Feed)")
+st.caption("Lists all 'Company Update' announcements in a table (no summarization). Includes best-effort mapping to SEBI regulations.")
 
-# =========================================
-# OpenAI client
-# =========================================
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
-if not api_key:
-    st.error("Missing OPENAI_API_KEY (set env var or add to Streamlit secrets).")
-    st.stop()
-
-@st.cache_resource(show_spinner=False)
-def _get_client(_api_key: str):
-    return OpenAI(api_key=_api_key)
-
-client = _get_client(api_key)
-
-with st.expander("🔍 OpenAI connection diagnostics", expanded=False):
-    key_src = "st.secrets" if "OPENAI_API_KEY" in st.secrets else "env"
-    mask = lambda s: (s[:7] + "..." + s[-4:]) if s and len(s) > 12 else "unset"
-    st.write("Key source:", key_src)
-    st.write("API key (masked):", mask(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")))
-    try:
-        _ = client.models.list()
-        st.success("Models list ok — auth looks good.")
-    except Exception as e:
-        st.error(f"Models list failed: {e}")
-
-# =========================================
+# =========================
 # Small utilities
-# =========================================
+# =========================
 _ILLEGAL_RX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 def _clean(s: str) -> str:
     return _ILLEGAL_RX.sub('', s) if isinstance(s, str) else s
@@ -54,6 +28,10 @@ def _first_col(df: pd.DataFrame, names):
 
 def _norm(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
+
+def _slug(s: str, maxlen: int = 60) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "_", str(s or "")).strip("_")
+    return (s[:maxlen] if len(s) > maxlen else s) or "file"
 
 def _fmt(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
@@ -76,25 +54,8 @@ def _candidate_urls(row):
             out.append(u); seen.add(u)
     return out
 
-def _head_ok_pdf(url, timeout=20) -> bool:
-    try:
-        r = requests.head(url, timeout=timeout, allow_redirects=True)
-        if r.status_code == 200:
-            if url.lower().endswith(".pdf"):
-                return True
-            if "pdf" in (r.headers.get("content-type","").lower()):
-                return True
-    except Exception:
-        pass
-    return False
-
-def _first_working_pdf(urls) -> str:
-    for u in urls:
-        if _head_ok_pdf(u):
-            return u
-    return ""
-
-def _download_pdf(url: str, timeout=25) -> bytes:
+def _download_head_pdf_url(urls, timeout=20):
+    """Return first PDF URL that responds with HTTP 200 and looks like a PDF (lightweight check)."""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0",
@@ -102,18 +63,30 @@ def _download_pdf(url: str, timeout=25) -> bytes:
         "Referer": "https://www.bseindia.com/corporates/ann.html",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    r = s.get(url, timeout=timeout, allow_redirects=True, stream=False)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    return r.content
+    for u in urls:
+        try:
+            r = s.head(u, timeout=timeout, allow_redirects=True)
+            if r.status_code == 200:
+                # Some BSE servers don't send content-type reliably; accept .pdf extension or 200 OK
+                if u.lower().endswith(".pdf") or "pdf" in (r.headers.get("content-type","").lower()):
+                    return u
+        except Exception:
+            continue
+    return ""
 
-# =========================================
-# BSE fetch (no subcategory filter here)
-# =========================================
-@st.cache_data(show_spinner=False)
+# =========================
+# BSE fetch — STRICT base
+# =========================
 def fetch_bse_announcements(start_yyyymmdd: str,
                             end_yyyymmdd: str,
+                            verbose: bool = False,
                             request_timeout: int = 25) -> pd.DataFrame:
+    """
+    Fetches raw announcements for the given date range.
+    We will later filter to Category='Company Update' ONLY (no subcategory filter).
+    """
+    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
+    assert start_yyyymmdd <= end_yyyymmdd
     base_page = "https://www.bseindia.com/corporates/ann.html"
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
@@ -127,6 +100,7 @@ def fetch_bse_announcements(start_yyyymmdd: str,
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     })
+
     try:
         s.get(base_page, timeout=15)
     except Exception:
@@ -149,7 +123,10 @@ def fetch_bse_announcements(start_yyyymmdd: str,
         rows, total, page = [], None, 1
         while True:
             r = s.get(url, params=params, timeout=request_timeout)
-            if "application/json" not in r.headers.get("content-type",""):
+            ct = r.headers.get("content-type","")
+            if "application/json" not in ct:
+                if verbose:
+                    st.warning(f"[variant {v}] non-JSON on page {page} (ct={ct}).")
                 break
             data = r.json()
             table = data.get("Table") or []
@@ -186,102 +163,61 @@ def filter_company_update_only(df_in: pd.DataFrame, category_filter="Company Upd
     df2["_cat_norm"] = df2[cat_col].map(lambda x: _norm(x).lower())
     return df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
 
-# =========================================
-# OpenAI: extract announcement type & regulations from PDF
-# =========================================
-PDF_EXTRACTION_SYSTEM = """You are a meticulous compliance analyst for Indian listed company filings.
-Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
-{
-  "announcement_type_from_pdf": "<short type name from the filing or obvious from its contents>",
-  "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
-}
-Rules:
-- Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
-  'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
-- If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
-- If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
-- Output ONLY the JSON, no prose.
-"""
+# =========================
+# Regulation inference
+# =========================
+# Best-effort mapping using headline/subcategory heuristics.
+# Note: BSE text is noisy; we map the common cases conservatively.
+_RULES = [
+    (r"(record date|book closure)", "Reg 42 (Record Date/Book Closure)"),
+    (r"(dividend|interim dividend|final dividend)", "Reg 30/42 (Dividend / Corporate Action)"),
+    (r"(board meeting outcome|outcome of board meeting|bm outcome)", "Reg 30 (Outcome of Board Meeting)"),
+    (r"(intimation of board meeting|board meeting intimation)", "Reg 29 (Board Meeting Intimation)"),
+    (r"(analyst|investor)\s+(meet|call|presentation)", "Reg 30 & Reg 46 (Analyst/Investor Meet/Presentation)"),
+    (r"(press release|media release|newspaper|publication)", "Reg 30 (Press/Media)"),
+    (r"(credit rating|reaffirmed rating|rating update)", "Reg 30 (Credit Rating)"),
+    (r"(agm|egm|postal ballot)", "Reg 30 & Reg 44 (Shareholder Meeting)"),
+    (r"(appointment|resignation).*(director|cfo|cs|ceo|kmp)", "Reg 30 (KMP/Director changes; Sch III Part A)"),
+    (r"(preferential issue|qip|private placement|allotment of shares|warrants)", "Reg 30 (Capital Raise)"),
+    (r"(buyback)", "SEBI Buyback Regulations & Reg 30"),
+    (r"(esop|stock option|rsu|grant)", "SEBI SBEB Regs & Reg 30"),
+    (r"(pledge|encumbrance|release of pledge)", "Reg 31 & Reg 30 (Encumbrance)"),
+    (r"(acquisition|amalgamation|merger|scheme of arrangement|demerger|slump sale|joint venture)", "Reg 30 (M&A / Scheme; Sch III)"),
+    (r"(trading window closure|window closure)", "SEBI (PIT) Regulations"),
+    (r"(related party|rpt)", "Reg 23 & Reg 30 (RPT)"),
+    (r"(change in statutory auditor|auditor resignation|auditor appointment)", "Reg 30 (Auditors)"),
+    (r"(intimation.*record date)", "Reg 42 (Record Date)"),
+]
 
-def openai_extract_from_pdf(pdf_bytes: bytes, model: str = "gpt-4.1-mini", max_output_tokens: int = 200) -> dict:
-    # Upload file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp.flush()
-        uploaded = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
+def infer_regulation(headline: str, subcategory: str) -> str:
+    text = f"{headline or ''} {subcategory or ''}".lower()
+    for rx, label in _RULES:
+        if re.search(rx, text):
+            return label
+    # If the exchange itself says "Disclosure under Reg 30"
+    if "reg 30" in text or "regulation 30" in text:
+        return "Reg 30 (Disclosure)"
+    return "Reg (best-effort not obvious)"
 
-    # Ask the model to return STRICT JSON
-    resp = client.responses.create(
-        model=model,
-        max_output_tokens=max_output_tokens,
-        temperature=0.0,
-        input=[{
-            "role": "system",
-            "content": [{"type": "input_text", "text": PDF_EXTRACTION_SYSTEM}]
-        },{
-            "role": "user",
-            "content": [{"type": "input_file", "file_id": uploaded.id}]
-        }],
-    )
-    raw = (resp.output_text or "").strip()
-    # Best-effort robust JSON parse
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict): raise ValueError("not dict")
-        # Normalize
-        t = data.get("announcement_type_from_pdf") or ""
-        regs = data.get("regulations_cited") or []
-        if isinstance(regs, str): regs = [regs]
-        regs = [r.strip() for r in regs if str(r).strip()]
-        if not regs: regs = ["Not disclosed"]
-        return {
-            "announcement_type_from_pdf": t.strip() or "Not disclosed",
-            "regulations_cited": list(dict.fromkeys(regs))  # de-dup preserve order
-        }
-    except Exception:
-        return {
-            "announcement_type_from_pdf": "Not disclosed",
-            "regulations_cited": ["Not disclosed"]
-        }
-
-def format_reg_list(regs: list[str]) -> str:
-    if not regs: return "Not disclosed"
-    # Collapse obvious duplicates/variants
-    uniq = []
-    seen = set()
-    for r in regs:
-        k = r.lower().strip()
-        if k not in seen:
-            seen.add(k); uniq.append(r)
-    return "; ".join(uniq)
-
-# =========================================
+# =========================
 # Sidebar controls
-# =========================================
+# =========================
 with st.sidebar:
     st.header("⚙️ Controls")
     today = datetime.now().date()
     start_date = st.date_input("Start date", value=today - timedelta(days=1), max_value=today)
     end_date   = st.date_input("End date", value=today, max_value=today, min_value=start_date)
+    max_items  = st.slider("Max announcements to fetch", 20, 1000, 200, step=20)
+    run        = st.button("🚀 Fetch Company Update")
 
-    model = st.selectbox(
-        "OpenAI model",
-        ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"],
-        index=0,
-        help="Models with file-reading capability. 4.1-mini/4o-mini are cost-efficient."
-    )
-    max_items  = st.slider("Max announcements to process", 10, 250, 60, step=10)
-    max_workers = st.slider("Parallel PDF reads", 1, 6, 3, help="Lower if you hit 429s.")
-    run = st.button("🚀 Fetch & Extract from PDFs", type="primary")
-
-# =========================================
+# =========================
 # Run
-# =========================================
+# =========================
 if run:
     start_str, end_str = _fmt(start_date), _fmt(end_date)
 
     with st.status("Fetching announcements…", expanded=True):
-        df_raw = fetch_bse_announcements(start_str, end_str)
+        df_raw = fetch_bse_announcements(start_str, end_str, verbose=False)
         st.write(f"Raw rows fetched: **{len(df_raw)}**")
         df_hits = filter_company_update_only(df_raw, category_filter="Company Update")
         st.write(f"'Company Update' rows: **{len(df_hits)}**")
@@ -293,78 +229,49 @@ if run:
     if len(df_hits) > max_items:
         df_hits = df_hits.head(max_items)
 
-    # Identify columns
+    # Identify common columns
     nm_col   = _first_col(df_hits, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
     sub_col  = _first_col(df_hits, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY"]) or "SUBCATEGORYNAME"
     date_col = _first_col(df_hits, ["NEWS_DT","DT","NEWSDATE","NEWS_DATE"]) or "NEWS_DT"
     head_col = _first_col(df_hits, ["HEADLINE","NEWS_SUB","SUBJECT","HEADING"]) or "HEADLINE"
 
-    rows = df_hits.to_dict(orient="records")
+    # Build rows with PDF URL and inferred regulation
+    out_rows = []
+    with st.status("Building table…", expanded=False):
+        for _, r in df_hits.iterrows():
+            company   = _clean(str(r.get(nm_col) or "").strip())
+            dt_raw    = str(r.get(date_col) or "").strip()
+            headline  = _clean(str(r.get(head_col) or "").strip())
+            subcat    = _clean(str(r.get(sub_col) or "").strip())
 
-    st.subheader("📄 Processing PDFs with OpenAI")
-    progress = st.progress(0)
+            # Date formatting (leave as-is if unknown)
+            dt_show = dt_raw
+            # Some feeds give "DD MMM YYYY HH:MM", others "YYYY-MM-DD", we'll not over-parse to avoid errors.
 
-    def worker(row):
-        urls = _candidate_urls(row)
-        pdf_url = _first_working_pdf(urls)
-        if not pdf_url:
-            return row, pdf_url, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
+            urls = _candidate_urls(r)
+            pdf_url = _download_head_pdf_url(urls) if urls else ""
 
-        try:
-            pdf_bytes = _download_pdf(pdf_url, timeout=25)
-            if not (pdf_bytes and len(pdf_bytes) > 500):
-                raise RuntimeError("PDF too small")
-            info = openai_extract_from_pdf(pdf_bytes, model=model, max_output_tokens=220)
-            return row, pdf_url, info
-        except Exception:
-            return row, pdf_url, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
+            reg_guess = infer_regulation(headline, subcat)
 
-    out = []
-    total = len(rows)
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(worker, r) for r in rows]
-        for fut in as_completed(futs):
-            row, pdf_url, info = fut.result()
-            company   = _clean(str(row.get(nm_col) or "").strip())
-            dt_show   = str(row.get(date_col) or "").strip()
-            headline  = _clean(str(row.get(head_col) or "").strip())
-            subcat    = _clean(str(row.get(sub_col) or "").strip())
-            regs_str  = format_reg_list(info.get("regulations_cited") or [])
-            # Build final table row
-            out.append({
+            out_rows.append({
                 "Company": company,
                 "Date": dt_show,
                 "Headline": headline,
-                "Announcement Type (BSE subcategory)": subcat or "NA",
-                "Interpreted Regulation (from PDF)": regs_str,
-                "PDF Link": pdf_url if pdf_url else ""
+                "Announcement Type": subcat or "NA",
+                "Interpreted Regulation (best-effort)": reg_guess,
+                "PDF Link": pdf_url
             })
-            done += 1
-            progress.progress(min(1.0, done/total))
 
-    # Sort by Date (fallback to as-is if parsing fails)
-    df_out = pd.DataFrame(out, columns=[
-        "Company","Date","Headline","Announcement Type (BSE subcategory)","Interpreted Regulation (from PDF)","PDF Link"
+    df_out = pd.DataFrame(out_rows, columns=[
+        "Company","Date","Headline","Announcement Type","Interpreted Regulation (best-effort)","PDF Link"
     ])
 
-    st.subheader("📋 Company Update — PDF-aware Tabular View")
-    st.dataframe(df_out.drop(columns=["PDF Link"]), use_container_width=True)
+    st.subheader("📋 Company Update — Tabular View")
+    st.dataframe(df_out, use_container_width=True)
 
-    # Provide PDF links separately (so it doesn't clutter the table)
-    with st.expander("🔗 PDF Links (click to open/download)"):
-        for i, r in df_out.iterrows():
-            if r["PDF Link"]:
-                st.markdown(f"- [{r['Company']} — {r['Date']}]({r['PDF Link']})  \n  `{r['Headline']}`")
-
-    # CSV download (includes PDF Link)
+    # CSV download
     csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download CSV (with PDF links)",
-        data=csv_bytes,
-        file_name=f"bse_company_update_pdf_tags_{start_str}_{end_str}.csv",
-        mime="text/csv"
-    )
+    st.download_button("⬇️ Download CSV", data=csv_bytes, file_name=f"bse_company_update_{start_str}_{end_str}.csv", mime="text/csv")
+
 else:
-    st.info("Pick your date range and click **Fetch & Extract from PDFs** to build the table.")
+    st.info("Pick your date range and click **Fetch Company Update** to see the table.")
