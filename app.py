@@ -326,20 +326,24 @@ if run:
         futs = [ex.submit(worker, r) for r in rows]
         for fut in as_completed(futs):
             row, pdf_url, info = fut.result()
-            company   = _clean(str(row.get(nm_col) or "").strip())
-            dt_show   = str(row.get(date_col) or "").strip()
-            headline  = _clean(str(row.get(head_col) or "").strip())
-            subcat    = _clean(str(row.get(sub_col) or "").strip())
-            regs_str  = format_reg_list(info.get("regulations_cited") or [])
-            # Build final table row
+    
+            company  = _clean(str(row.get(nm_col) or "").strip())
+            dt_show  = str(row.get(date_col) or "").strip()
+            headline = _clean(str(row.get(head_col) or "").strip())
+    
+            # ⬇️ pull both fields from the OpenAI JSON `info`
+            ann_type_from_pdf = (info.get("announcement_type_from_pdf") or "Not disclosed").strip()
+            regs_str          = format_reg_list(info.get("regulations_cited") or [])
+    
             out.append({
                 "Company": company,
                 "Date": dt_show,
                 "Headline": headline,
-                "Announcement Type (BSE subcategory)": subcat or "NA",
+                "Announcement Type (from PDF)": ann_type_from_pdf,
                 "Interpreted Regulation (from PDF)": regs_str,
                 "PDF Link": pdf_url if pdf_url else ""
             })
+    
             done += 1
             progress.progress(min(1.0, done/total))
 
