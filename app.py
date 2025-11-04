@@ -323,29 +323,29 @@ if run:
     done = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-    futs = [ex.submit(worker, r) for r in rows]
-    for fut in as_completed(futs):
-        row, pdf_url, info = fut.result()
-
-        company  = _clean(str(row.get(nm_col) or "").strip())
-        dt_show  = str(row.get(date_col) or "").strip()
-        headline = _clean(str(row.get(head_col) or "").strip())
-
-        # ⬇️ NO processing: copy OpenAI fields exactly as returned
-        ann_type_from_pdf = info.get("announcement_type_from_pdf")
-        regs_from_pdf     = info.get("regulations_cited")
-
-        out.append({
-            "Company": company,
-            "Date": dt_show,
-            "Headline": headline,
-            "Announcement Type": ann_type_from_pdf,          # exact value from OpenAI
-            "Interpreted Regulation": regs_from_pdf,         # exact value from OpenAI (likely a list)
-            "PDF Link": pdf_url if pdf_url else ""
-        })
-
-        done += 1
-        progress.progress(min(1.0, done/total))
+        futs = [ex.submit(worker, r) for r in rows]
+        for fut in as_completed(futs):
+            row, pdf_url, info = fut.result()
+    
+            company  = _clean(str(row.get(nm_col) or "").strip())
+            dt_show  = str(row.get(date_col) or "").strip()
+            headline = _clean(str(row.get(head_col) or "").strip())
+    
+            # ⬇️ NO processing: copy OpenAI fields exactly as returned
+            ann_type_from_pdf = info.get("announcement_type_from_pdf")
+            regs_from_pdf     = info.get("regulations_cited")
+    
+            out.append({
+                "Company": company,
+                "Date": dt_show,
+                "Headline": headline,
+                "Announcement Type": ann_type_from_pdf,          # exact value from OpenAI
+                "Interpreted Regulation": regs_from_pdf,         # exact value from OpenAI (likely a list)
+                "PDF Link": pdf_url if pdf_url else ""
+            })
+    
+            done += 1
+            progress.progress(min(1.0, done/total))
 
     # Sort by Date (fallback to as-is if parsing fails)
     df_out = pd.DataFrame(out, columns=[
