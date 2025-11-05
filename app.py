@@ -10,9 +10,9 @@ from openai import OpenAI
 # =========================================
 # Streamlit page
 # =========================================
-st.set_page_config(page_title="BSE — Company Update (PDF-aware tags)", layout="wide")
-st.title("📑 BSE — Company Update (PDF-aware Announcement Type & Regulation)")
-st.caption("Reads each PDF with OpenAI to extract Announcement Type (from PDF text) and cited Regulations. No summaries.")
+st.set_page_config(page_title="BSE — Company Update", layout="wide")
+st.title("📑 BSE — Company Update (Announcement Type & Regulation)")
+st.caption("Reads each PDF with OpenAI to extract Announcement Type (from PDF text) and cited Regulations.")
 
 # =========================================
 # OpenAI client
@@ -80,10 +80,8 @@ def _head_ok_pdf(url, timeout=20) -> bool:
     try:
         r = requests.head(url, timeout=timeout, allow_redirects=True)
         if r.status_code == 200:
-            if url.lower().endswith(".pdf"):
-                return True
-            if "pdf" in (r.headers.get("content-type","").lower()):
-                return True
+            if url.lower().endswith(".pdf"): return True
+            if "pdf" in (r.headers.get("content-type","").lower()): return True
     except Exception:
         pass
     return False
@@ -199,6 +197,7 @@ Rules:
 - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
   'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
 - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
+- If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
 - Output ONLY the JSON, no prose.
 """
 
@@ -212,6 +211,7 @@ def openai_extract_from_pdf(pdf_bytes: bytes, model: str = "gpt-4.1-mini", max_o
     # Ask the model to return STRICT JSON
     resp = client.responses.create(
         model=model,
+        response_format={"type": "json_object"},  # ensure strict JSON
         max_output_tokens=max_output_tokens,
         temperature=0.0,
         input=[{
@@ -223,39 +223,23 @@ def openai_extract_from_pdf(pdf_bytes: bytes, model: str = "gpt-4.1-mini", max_o
         }],
     )
 
-
     raw = (resp.output_text or "").strip()
-    st.debug(f"RAW OpenAI JSON: {raw}")   # right after resp
-    # Best-effort robust JSON parse
+    # Optional: view the raw JSON string for debugging
+    # st.debug(f"RAW OpenAI JSON: {raw}")
+
+    # Keep the keys EXACTLY as returned — minimal validation
     try:
         data = json.loads(raw)
-        if not isinstance(data, dict): raise ValueError("not dict")
-        # Normalize
-        t = data.get("announcement_type_from_pdf") or ""
-        regs = data.get("regulations_cited") or []
-        if isinstance(regs, str): regs = [regs]
-        regs = [r.strip() for r in regs if str(r).strip()]
-        if not regs: regs = ["Not disclosed"]
+        if not isinstance(data, dict):
+            raise ValueError("Model did not return a JSON object.")
+        return data
+    except Exception as e:
+        # If anything goes wrong, still return a dict so the pipeline continues
         return {
-            "announcement_type_from_pdf": t.strip() or "Not disclosed",
-            "regulations_cited": list(dict.fromkeys(regs))  # de-dup preserve order
+            "announcement_type_from_pdf": None,
+            "regulations_cited": None,
+            "_error": f"parse_error: {e}"
         }
-    except Exception:
-        return {
-            "announcement_type_from_pdf": "Not disclosed",
-            "regulations_cited": ["Not disclosed"]
-        }
-
-def format_reg_list(regs: list[str]) -> str:
-    if not regs: return "Not disclosed"
-    # Collapse obvious duplicates/variants
-    uniq = []
-    seen = set()
-    for r in regs:
-        k = r.lower().strip()
-        if k not in seen:
-            seen.add(k); uniq.append(r)
-    return "; ".join(uniq)
 
 # =========================================
 # Sidebar controls
@@ -297,7 +281,6 @@ if run:
 
     # Identify columns
     nm_col   = _first_col(df_hits, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
-    sub_col  = _first_col(df_hits, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY"]) or "SUBCATEGORYNAME"
     date_col = _first_col(df_hits, ["NEWS_DT","DT","NEWSDATE","NEWS_DATE"]) or "NEWS_DT"
     head_col = _first_col(df_hits, ["HEADLINE","NEWS_SUB","SUBJECT","HEADING"]) or "HEADLINE"
 
@@ -310,18 +293,25 @@ if run:
         urls = _candidate_urls(row)
         pdf_url = _first_working_pdf(urls)
         if not pdf_url:
-            return row, pdf_url, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
-
+            return row, pdf_url, {
+                "announcement_type_from_pdf": None,
+                "regulations_cited": None,
+                "_error": "no_pdf_url_found"
+            }
         try:
             pdf_bytes = _download_pdf(pdf_url, timeout=25)
             if not (pdf_bytes and len(pdf_bytes) > 500):
                 raise RuntimeError("PDF too small")
             info = openai_extract_from_pdf(pdf_bytes, model=model, max_output_tokens=220)
             return row, pdf_url, info
-        except Exception:
-            return row, pdf_url, {"announcement_type_from_pdf":"Not disclosed","regulations_cited":["Not disclosed"]}
+        except Exception as e:
+            return row, pdf_url, {
+                "announcement_type_from_pdf": None,
+                "regulations_cited": None,
+                "_error": f"download_or_extract_error: {e}"
+            }
 
-    out = []
+    records = []
     total = len(rows)
     done = 0
 
@@ -329,47 +319,47 @@ if run:
         futs = [ex.submit(worker, r) for r in rows]
         for fut in as_completed(futs):
             row, pdf_url, info = fut.result()
-    
+
             company  = _clean(str(row.get(nm_col) or "").strip())
             dt_show  = str(row.get(date_col) or "").strip()
             headline = _clean(str(row.get(head_col) or "").strip())
-    
-            # ⬇️ NO processing: copy OpenAI fields exactly as returned
-            ann_type_from_pdf = info.get("announcement_type_from_pdf")
-            regs_from_pdf     = info.get("regulations_cited")
-    
-            out.append({
-                "Company": company,
-                "Date": dt_show,
-                "Headline": headline,
-                "Announcement Type": ann_type_from_pdf,          # exact value from OpenAI
-                "Interpreted Regulation": regs_from_pdf,         # exact value from OpenAI (likely a list)
-                "PDF Link": pdf_url if pdf_url else ""
+
+            # Copy the OpenAI fields EXACTLY as returned — no processing
+            records.append({
+                "company": company,
+                "date": dt_show,
+                "headline": headline,
+                "pdf_link": pdf_url or "",
+                "announcement_type": info.get("announcement_type_from_pdf"),
+                "interpreted_regulation": info.get("regulations_cited"),
+                # optional debug field if present
+                **({"_error": info.get("_error")} if "_error" in info else {})
             })
-    
+
             done += 1
             progress.progress(min(1.0, done/total))
 
-    # Sort by Date (fallback to as-is if parsing fails)
-    df_out = pd.DataFrame(out, columns=[
-    "Company","Date","Headline","Announcement Type (BSE subcategory)","Interpreted Regulation (from PDF)","PDF Link"])
+    # --- JSON-first rendering (no table) ---
+    st.subheader("📄 Extracted tags per filing (JSON)")
+    st.caption("Exactly what OpenAI returned for each PDF, alongside basic identifiers and PDF link.")
+    st.json(records)
 
-    st.subheader("📋 Company Update — PDF-aware Tabular View")
-    st.dataframe(df_out.drop(columns=["PDF Link"]), use_container_width=True)
-
-    # Provide PDF links separately (so it doesn't clutter the table)
-    with st.expander("🔗 PDF Links (click to open/download)"):
-        for i, r in df_out.iterrows():
-            if r["PDF Link"]:
-                st.markdown(f"- [{r['Company']} — {r['Date']}]({r['PDF Link']})  \n  `{r['Headline']}`")
-
-    # CSV download (includes PDF Link)
-    csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+    # Downloads: JSON and NDJSON
+    json_bytes = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
     st.download_button(
-        "⬇️ Download CSV (with PDF links)",
-        data=csv_bytes,
-        file_name=f"bse_company_update_pdf_tags_{start_str}_{end_str}.csv",
-        mime="text/csv"
+        "⬇️ Download JSON",
+        data=json_bytes,
+        file_name=f"bse_company_update_tags_{start_str}_{end_str}.json",
+        mime="application/json"
     )
+
+    ndjson_bytes = "\n".join(json.dumps(rec, ensure_ascii=False) for rec in records).encode("utf-8")
+    st.download_button(
+        "⬇️ Download NDJSON (one JSON per line)",
+        data=ndjson_bytes,
+        file_name=f"bse_company_update_tags_{start_str}_{end_str}.ndjson",
+        mime="application/x-ndjson"
+    )
+
 else:
-    st.info("Pick your date range and click **Fetch & Extract from PDFs** to build the table.")
+    st.info("Pick your date range and click **Fetch & Extract from PDFs** to build the JSON output.")
