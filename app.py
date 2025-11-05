@@ -7,8 +7,6 @@ import pandas as pd
 import numpy as np
 from openai import OpenAI
 import os, streamlit as st
-import json
-
 # ---- OpenAI (Responses API) ----
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -206,47 +204,66 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
     return f
 
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
-                              model: str = "gpt-4.1-mini", style: str = "bullets",
-                              max_output_tokens: int = 800, temperature: float = 0.2) -> dict:
-                                  
-    """
-    Uploads the PDF and asks OpenAI to return STRICT JSON with:
-      - announcement_type_from_pdf
-      - regulations_cited
-    Returns a dict (never a string).
-    """
-    fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
-
-    # JSON braces must be escaped as {{ }}
-    task = f"""
-    You are a meticulous compliance analyst for Indian listed company filings.
-    Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
-    {{
-      "announcement_type_from_pdf": "<short type name from the filing or obvious from its contents>",
-      "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
-    }}
-    Rules:
-    - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting',
-      'Record Date', 'Dividend Declaration', 'Investor Presentation', 'Trading Window Closure', 'Credit Rating',
-      'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
-    - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'),
-      include them in regulations_cited (exact text; avoid duplicates).
-    - If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
-    - Output ONLY the JSON, no prose.
+                              model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
+                              temperature: float = 0.2) -> str:
+        """
+        Uses the Responses API with a file attachment. The model reads the PDF and returns a summary.
+        """
+        fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
     
-    Context:
-    Company: {company or 'NA'}
-    Headline: {headline or 'NA'}
-    Subcategory: {subcat or 'NA'}
-    """
+        # NOTE: JSON braces in an f-string must be escaped as {{ and }}
 
-    try:
+        task = f"""
+        You are a meticulous compliance and regulatory analyst specializing in Indian listed company filings.
+        Read the attached BSE/SEBI filing PDF carefully and produce a table with exactly three columns:
+        
+        1) Company
+        2) Announcement Type From PDF
+        3) Regulations
+        
+        Guidelines:
+        - In "Company", copy the company name from the provided context below (do not infer a different legal name unless the PDF clearly states it).
+        - In "Announcement Type From PDF", give a concise, specific title that best describes the nature of the announcement
+          (e.g., "Outcome of Board Meeting", "Intimation of Board Meeting", "Record Date", "Dividend Declaration",
+          "Investor Presentation", "Trading Window Closure", "Credit Rating", "Press Release", "RPT Disclosure",
+          "Auditor Appointment", "KMP Change", "Buyback", "Preferential Issue / QIP", etc.).
+        - In "Regulations":
+          - If the PDF explicitly cites SEBI / LODR / PIT / Companies Act regulations, include the **exact text** (e.g., "Regulation 30 of SEBI (LODR) Regulations, 2015").
+          - If no direct citation appears, infer the **most likely applicable regulation** based on the document’s content and standard practice. Examples:
+              • Board meeting outcomes → Regulation 30
+              • Financial results → Regulation 33
+              • Shareholding pattern → Regulation 31
+              • Trading window closure → SEBI (PIT) Regulations, Schedule B
+              • Preferential issue / QIP → SEBI (ICDR) Regulations (e.g., Reg. 164 for pricing)
+              • Press release / investor presentation → Regulation 30
+              • Change in director / KMP → Regulation 30
+              • Dividend declaration → Regulation 43
+          - If multiple clearly apply, separate with semicolons; if no reasonable inference is possible, write "Not disclosed".
+        
+        Output format — return ONLY valid JSON with this exact structure (no prose, no markdown):
+        
+        {{
+          "table": [
+            {{
+              "Company": "{company or 'NA'}",
+              "Announcement Type From PDF": "<announcement type>",
+              "Regulations": "<exact or inferred regulation(s)>"
+            }}
+          ]
+        }}
+        
+        Context:
+        Company: {company or 'NA'}
+        Headline: {headline or 'NA'}
+        Subcategory: {subcat or 'NA'}
+        """
+
+
+    
         resp = client.responses.create(
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
-            # ↓ FIX: safer JSON mode toggle
-            response_format="json",  
             input=[{
                 "role": "user",
                 "content": [
@@ -255,25 +272,7 @@ def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, sub
                 ],
             }],
         )
-
-        raw = (resp.output_text or "").strip()
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Model did not return a JSON object")
-
-        data.setdefault("announcement_type_from_pdf", "Not disclosed")
-        data.setdefault("regulations_cited", ["Not disclosed"])
-        return data
-
-    except Exception as e:
-        # Safely log or show a minimal error
-        st.warning(f"⚠️ OpenAI error while reading PDF ({company}): {e}")
-        return {
-            "announcement_type_from_pdf": "Not disclosed",
-            "regulations_cited": ["Not disclosed"]
-        }
-
-
+        return (resp.output_text or "").strip()
 # Simple rate-limit friendly wrapper
 def safe_summarize(*args, **kwargs) -> str:
     for i in range(4):
@@ -374,51 +373,23 @@ if run:
                                  temperature=float(temperature))
         return idx, used_url, summary, None
 
-
     # Run with limited parallelism
-    results = []  # will hold (idx, company, info_dict)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
         for fut in as_completed(futs):
-            i, pdf_url, info, _ = fut.result()
+            i, pdf_url, summary, _ = fut.result()
             r = rows[i][0]
             company = str(r.get(nm) or "").strip()
-            # collect exactly what we need for the table
-            announcement = info.get("announcement_type_from_pdf", "Not disclosed")
-            regs = info.get("regulations_cited", ["Not disclosed"])
-            # regs may be list or string; render to one string for table
-            if isinstance(regs, list):
-                regs_str = "; ".join(str(x) for x in regs)
-            else:
-                regs_str = str(regs)
-            results.append((i, company, announcement, regs_str))
-    
-    # Sort by original index and assign S.No
-        results.sort(key=lambda x: x[0])
-        table_rows = []
-        for serial, (_, company, announcement, regs_str) in enumerate(results, start=1):
-            table_rows.append({
-                "S.No": serial,
-                "Company Name": company,
-                "Announcement_Type_From_PDF": announcement,
-                "Regulations_Cited": regs_str
-            })
-    
-        df_table = pd.DataFrame(table_rows, columns=[
-            "S.No", "Company Name", "Announcement_Type_From_PDF", "Regulations_Cited"
-        ])
-    
-        st.subheader("📑 Summaries (OpenAI)")
-        st.dataframe(df_table, use_container_width=True)
-    
-        # CSV download
-        csv_bytes = df_table.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name=f"bse_company_update_tags_{start_str}_{end_str}.csv",
-            mime="text/csv"
-        )
+            dt = str(r.get("NEWS_DT") or "").strip()
+            subcat = str(r.get(subcol) or "").strip()
+            headline = str(r.get("HEADLINE") or "").strip()
+
+            with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}", expanded=False):
+                if headline:
+                    st.markdown(f"**Headline:** {headline}")
+                if pdf_url:
+                    st.markdown(f"[PDF link]({pdf_url})")
+                st.markdown(summary)
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
