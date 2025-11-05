@@ -247,6 +247,63 @@ def _render_bordered_table_from_json(json_text: str, key: str = "table"):
         st.warning(f"Could not parse model output as JSON ({e}). Showing raw text:")
         st.code(json_text)
 
+# ---- Helper: parse model JSON safely into rows ----
+def _extract_rows_from_model(summary_text: str, fallback_company: str, key: str = "table") -> list[dict]:
+    """
+    Accepts raw model text (which may contain markdown fences, smart quotes, etc.).
+    Returns a list of dict rows. If parsing fails, returns a single fallback row.
+    """
+    cleaned = (
+        (summary_text or "").strip()
+        .replace("```json", "")
+        .replace("```", "")
+        .replace("“", '"').replace("”", '"').replace("’", "'")
+    )
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+
+    rows: list[dict] = []
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            rows = obj.get(key, [])
+        elif isinstance(obj, list):
+            rows = obj
+    except Exception:
+        rows = []
+
+    # Normalize + fallback
+    if not rows:
+        rows = [{
+            "Company": fallback_company or "NA",
+            "Announcement Type From PDF": "Not disclosed",
+            "Regulations": "Not disclosed",
+        }]
+
+    # Ensure required columns; fill company if missing
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "Company": r.get("Company") or fallback_company or "NA",
+            "Announcement Type From PDF": r.get("Announcement Type From PDF", "Not disclosed"),
+            "Regulations": r.get("Regulations", "Not disclosed"),
+        })
+    return out
+
+
+def _render_bordered_table(df: pd.DataFrame):
+    styled = (
+        df.style
+          .hide(axis="index")
+          .set_table_styles([
+              {"selector": "table", "props": "border-collapse: collapse; border: 1px solid #bbb;"},
+              {"selector": "th", "props": "border: 1px solid #bbb; padding: 8px; background: #f6f7fb; text-align: left;"},
+              {"selector": "td", "props": "border: 1px solid #bbb; padding: 8px;"},
+          ])
+    )
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
@@ -419,23 +476,68 @@ if run:
                                  temperature=float(temperature))
         return idx, used_url, summary, None
 
-    # Run with limited parallelism
+    # ---- Run with limited parallelism and build one combined table ----
+    combined_rows = []  # will hold dict rows from every filing
+    
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
         for fut in as_completed(futs):
             i, pdf_url, summary, _ = fut.result()
             r = rows[i][0]
-            company = str(r.get(nm) or "").strip()
-            dt = str(r.get("NEWS_DT") or "").strip()
-            subcat = str(r.get(subcol) or "").strip()
+            company  = str(r.get(nm) or "").strip()
+            dt       = str(r.get("NEWS_DT") or "").strip()
+            subcat   = str(r.get(subcol) or "").strip()
             headline = str(r.get("HEADLINE") or "").strip()
-
-            with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}", expanded=False):
-                if headline:
-                    st.markdown(f"**Headline:** {headline}")
-                if pdf_url:
-                    st.markdown(f"[PDF link]({pdf_url})")
-                _render_bordered_table_from_json(summary, key="table")
+    
+            # Parse rows from model output and accumulate
+            parsed_rows = _extract_rows_from_model(summary, fallback_company=company, key="table")
+            # (Optional) keep context columns if you want:
+            for row in parsed_rows:
+                row["_Date"] = dt
+                row["_Subcategory"] = subcat
+                row["_PDF"] = pdf_url
+                row["_Headline"] = headline
+            combined_rows.extend(parsed_rows)
+    
+    # Build final DataFrame (show the three main columns; you can add context columns if desired)
+    if combined_rows:
+        df_all = pd.DataFrame(combined_rows)
+    
+        # Keep only the three requested columns for the display table
+        display_cols = ["Company", "Announcement Type From PDF", "Regulations"]
+        for c in display_cols:
+            if c not in df_all.columns:
+                df_all[c] = ""
+    
+        # Add S.No (optional)
+        df_all.insert(0, "S.No", range(1, len(df_all) + 1))
+    
+        st.subheader("📑 Combined Table (All Filings)")
+        _render_bordered_table(df_all[["S.No"] + display_cols])
+    
+        # ---- Downloads ----
+        # CSV
+        csv_bytes = df_all[["S.No"] + display_cols].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name=f"bse_combined_filings_{start_str}_{end_str}.csv",
+            mime="text/csv"
+        )
+    
+        # Excel
+        from io import BytesIO
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+            df_all[["S.No"] + display_cols].to_excel(writer, index=False, sheet_name="Filings")
+        st.download_button(
+            "⬇️ Download Excel (.xlsx)",
+            data=xbuf.getvalue(),
+            file_name=f"bse_combined_filings_{start_str}_{end_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("No rows parsed from model outputs.")
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
