@@ -431,10 +431,6 @@ if run:
             headline = str(r.get("HEADLINE") or "").strip()
 
             with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}", expanded=False):
-                if headline:
-                    st.markdown(f"**Headline:** {headline}")
-                if pdf_url:
-                    st.markdown(f"[PDF link]({pdf_url})")
                 _render_bordered_table_from_json(summary, key="table")
 
 else:
