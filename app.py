@@ -203,6 +203,38 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
         f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
     return f
 
+def _render_bordered_table_from_json(json_text: str, key: str = "table"):
+    """
+    Accepts a JSON string like:
+      { "table": [ { "Company": "...", "Announcement Type From PDF": "...", "Regulations": "..." } ] }
+    and renders a bordered HTML table in Streamlit.
+    Falls back to showing raw text if parsing fails.
+    """
+    try:
+        data = json.loads(json_text)
+        rows = data.get(key, [])
+        if not isinstance(rows, list) or not rows:
+            st.warning("No rows found in JSON under key 'table'.")
+            st.code(json_text, language="json")
+            return
+        df = pd.DataFrame(rows)
+        # Build a bordered HTML table
+        styled = (
+            df.style
+              .hide(axis="index")
+              .set_table_styles([
+                  {"selector": "table", "props": "border-collapse: collapse; border: 1px solid #bbb;"},
+                  {"selector": "th",    "props": "border: 1px solid #bbb; padding: 8px; background: #f6f7fb; text-align: left;"},
+                  {"selector": "td",    "props": "border: 1px solid #bbb; padding: 8px;"},
+              ])
+        )
+        st.markdown(styled.to_html(), unsafe_allow_html=True)
+    except Exception:
+        # If the model outputs something non-JSON, show it raw so you can inspect
+        st.warning("Could not parse model output as JSON. Showing raw text:")
+        st.code(json_text)
+
+
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
                               model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
                               temperature: float = 0.2) -> str:
@@ -389,7 +421,7 @@ if run:
                     st.markdown(f"**Headline:** {headline}")
                 if pdf_url:
                     st.markdown(f"[PDF link]({pdf_url})")
-                st.markdown(summary)
+                _render_bordered_table_from_json(summary, key="table")
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
