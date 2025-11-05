@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 from openai import OpenAI
 import os, streamlit as st
+import json
+
 # ---- OpenAI (Responses API) ----
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
@@ -205,12 +207,16 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
 
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
                               model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
-                              temperature: float = 0.2) -> str:
+                              temperature: float = 0.2) -> dict:
+                             
         """
-        Uses the Responses API with a file attachment. The model reads the PDF and returns a summary.
+        Uploads the PDF and asks OpenAI to return STRICT JSON with:
+          - announcement_type_from_pdf
+          - regulations_cited
+        Returns a dict (never a string).
         """
         fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
-    
+
         # NOTE: JSON braces in an f-string must be escaped as {{ and }}
         task = f"""
     You are a meticulous compliance analyst for Indian listed company filings.
@@ -225,17 +231,18 @@ def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, sub
     - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
     - If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
     - Output ONLY the JSON, no prose.
-    
+
     Context:
     Company: {company or 'NA'}
     Headline: {headline or 'NA'}
     Subcategory: {subcat or 'NA'}
     """
-    
+
         resp = client.responses.create(
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            response_format={"type": "json_object"},  # force valid JSON
             input=[{
                 "role": "user",
                 "content": [
@@ -244,7 +251,21 @@ def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, sub
                 ],
             }],
         )
-        return (resp.output_text or "").strip()
+        raw = (resp.output_text or "").strip()
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("Model did not return a JSON object")
+            # minimal safety net to ensure keys exist
+            data.setdefault("announcement_type_from_pdf", "Not disclosed")
+            data.setdefault("regulations_cited", ["Not disclosed"])
+            return data
+        except Exception:
+            return {
+                "announcement_type_from_pdf": "Not disclosed",
+                "regulations_cited": ["Not disclosed"]
+            }
+
 # Simple rate-limit friendly wrapper
 def safe_summarize(*args, **kwargs) -> str:
     for i in range(4):
@@ -346,22 +367,51 @@ if run:
         return idx, used_url, summary, None
 
     # Run with limited parallelism
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
-        for fut in as_completed(futs):
-            i, pdf_url, summary, _ = fut.result()
-            r = rows[i][0]
-            company = str(r.get(nm) or "").strip()
-            dt = str(r.get("NEWS_DT") or "").strip()
-            subcat = str(r.get(subcol) or "").strip()
-            headline = str(r.get("HEADLINE") or "").strip()
+# Run with limited parallelism
+results = []  # will hold (idx, company, info_dict)
+with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
+    for fut in as_completed(futs):
+        i, pdf_url, info, _ = fut.result()
+        r = rows[i][0]
+        company = str(r.get(nm) or "").strip()
+        # collect exactly what we need for the table
+        announcement = info.get("announcement_type_from_pdf", "Not disclosed")
+        regs = info.get("regulations_cited", ["Not disclosed"])
+        # regs may be list or string; render to one string for table
+        if isinstance(regs, list):
+            regs_str = "; ".join(str(x) for x in regs)
+        else:
+            regs_str = str(regs)
+        results.append((i, company, announcement, regs_str))
 
-            with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}", expanded=False):
-                if headline:
-                    st.markdown(f"**Headline:** {headline}")
-                if pdf_url:
-                    st.markdown(f"[PDF link]({pdf_url})")
-                st.markdown(summary)
+# Sort by original index and assign S.No
+    results.sort(key=lambda x: x[0])
+    table_rows = []
+    for serial, (_, company, announcement, regs_str) in enumerate(results, start=1):
+        table_rows.append({
+            "S.No": serial,
+            "Company Name": company,
+            "Announcement_Type_From_PDF": announcement,
+            "Regulations_Cited": regs_str
+        })
+
+    df_table = pd.DataFrame(table_rows, columns=[
+        "S.No", "Company Name", "Announcement_Type_From_PDF", "Regulations_Cited"
+    ])
+
+    st.subheader("📑 Summaries (OpenAI)")
+    st.dataframe(df_table, use_container_width=True)
+
+    # CSV download
+    csv_bytes = df_table.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv_bytes,
+        file_name=f"bse_company_update_tags_{start_str}_{end_str}.csv",
+        mime="text/csv"
+    )
+
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
