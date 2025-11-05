@@ -205,34 +205,48 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
 
 def _render_bordered_table_from_json(json_text: str, key: str = "table"):
     """
-    Accepts a JSON string like:
-      { "table": [ { "Company": "...", "Announcement Type From PDF": "...", "Regulations": "..." } ] }
-    and renders a bordered HTML table in Streamlit.
-    Falls back to showing raw text if parsing fails.
+    Safely render a bordered table from JSON-like text.
+    Auto-cleans extra backticks, markdown fences, and stray text.
     """
+    import json
+    import pandas as pd
+    import streamlit as st
+
+    cleaned = (
+        json_text.strip()
+        .replace("```json", "")
+        .replace("```", "")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+    )
+
+    # Try to find the first '{' and last '}' to isolate valid JSON
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+
     try:
-        data = json.loads(json_text)
+        data = json.loads(cleaned)
         rows = data.get(key, [])
-        if not isinstance(rows, list) or not rows:
-            st.warning("No rows found in JSON under key 'table'.")
-            st.code(json_text, language="json")
+        if not rows:
+            st.warning("No rows found in parsed JSON.")
+            st.code(cleaned, language="json")
             return
         df = pd.DataFrame(rows)
-        # Build a bordered HTML table
         styled = (
             df.style
               .hide(axis="index")
               .set_table_styles([
                   {"selector": "table", "props": "border-collapse: collapse; border: 1px solid #bbb;"},
-                  {"selector": "th",    "props": "border: 1px solid #bbb; padding: 8px; background: #f6f7fb; text-align: left;"},
-                  {"selector": "td",    "props": "border: 1px solid #bbb; padding: 8px;"},
+                  {"selector": "th", "props": "border: 1px solid #bbb; padding: 8px; background: #f6f7fb; text-align: left;"},
+                  {"selector": "td", "props": "border: 1px solid #bbb; padding: 8px;"},
               ])
         )
         st.markdown(styled.to_html(), unsafe_allow_html=True)
-    except Exception:
-        # If the model outputs something non-JSON, show it raw so you can inspect
-        st.warning("Could not parse model output as JSON. Showing raw text:")
+    except Exception as e:
+        st.warning(f"Could not parse model output as JSON ({e}). Showing raw text:")
         st.code(json_text)
+
 
 
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
