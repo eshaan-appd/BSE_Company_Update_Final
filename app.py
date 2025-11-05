@@ -206,19 +206,19 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
     return f
 
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
-                              model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
-                              temperature: float = 0.2) -> dict:
-                             
-        """
-        Uploads the PDF and asks OpenAI to return STRICT JSON with:
-          - announcement_type_from_pdf
-          - regulations_cited
-        Returns a dict (never a string).
-        """
-        fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
+                              model: str = "gpt-4.1-mini", style: str = "bullets",
+                              max_output_tokens: int = 800, temperature: float = 0.2) -> dict:
+                                  
+    """
+    Uploads the PDF and asks OpenAI to return STRICT JSON with:
+      - announcement_type_from_pdf
+      - regulations_cited
+    Returns a dict (never a string).
+    """
+    fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
 
-        # NOTE: JSON braces in an f-string must be escaped as {{ and }}
-        task = f"""
+    # JSON braces must be escaped as {{ }}
+    task = f"""
     You are a meticulous compliance analyst for Indian listed company filings.
     Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
     {{
@@ -226,23 +226,27 @@ def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, sub
       "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
     }}
     Rules:
-    - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
-      'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
-    - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
+    - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting',
+      'Record Date', 'Dividend Declaration', 'Investor Presentation', 'Trading Window Closure', 'Credit Rating',
+      'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
+    - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'),
+      include them in regulations_cited (exact text; avoid duplicates).
     - If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
     - Output ONLY the JSON, no prose.
-
+    
     Context:
     Company: {company or 'NA'}
     Headline: {headline or 'NA'}
     Subcategory: {subcat or 'NA'}
     """
 
+    try:
         resp = client.responses.create(
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
-            response_format={"type": "json_object"},  # force valid JSON
+            # ↓ FIX: safer JSON mode toggle
+            response_format="json",  
             input=[{
                 "role": "user",
                 "content": [
@@ -251,20 +255,24 @@ def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, sub
                 ],
             }],
         )
+
         raw = (resp.output_text or "").strip()
-        try:
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise ValueError("Model did not return a JSON object")
-            # minimal safety net to ensure keys exist
-            data.setdefault("announcement_type_from_pdf", "Not disclosed")
-            data.setdefault("regulations_cited", ["Not disclosed"])
-            return data
-        except Exception:
-            return {
-                "announcement_type_from_pdf": "Not disclosed",
-                "regulations_cited": ["Not disclosed"]
-            }
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Model did not return a JSON object")
+
+        data.setdefault("announcement_type_from_pdf", "Not disclosed")
+        data.setdefault("regulations_cited", ["Not disclosed"])
+        return data
+
+    except Exception as e:
+        # Safely log or show a minimal error
+        st.warning(f"⚠️ OpenAI error while reading PDF ({company}): {e}")
+        return {
+            "announcement_type_from_pdf": "Not disclosed",
+            "regulations_cited": ["Not disclosed"]
+        }
+
 
 # Simple rate-limit friendly wrapper
 def safe_summarize(*args, **kwargs) -> str:
