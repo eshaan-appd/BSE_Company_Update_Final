@@ -366,52 +366,51 @@ if run:
                                  temperature=float(temperature))
         return idx, used_url, summary, None
 
+
     # Run with limited parallelism
-# Run with limited parallelism
-results = []  # will hold (idx, company, info_dict)
-with ThreadPoolExecutor(max_workers=max_workers) as ex:
-    futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
-    for fut in as_completed(futs):
-        i, pdf_url, info, _ = fut.result()
-        r = rows[i][0]
-        company = str(r.get(nm) or "").strip()
-        # collect exactly what we need for the table
-        announcement = info.get("announcement_type_from_pdf", "Not disclosed")
-        regs = info.get("regulations_cited", ["Not disclosed"])
-        # regs may be list or string; render to one string for table
-        if isinstance(regs, list):
-            regs_str = "; ".join(str(x) for x in regs)
-        else:
-            regs_str = str(regs)
-        results.append((i, company, announcement, regs_str))
-
-# Sort by original index and assign S.No
-    results.sort(key=lambda x: x[0])
-    table_rows = []
-    for serial, (_, company, announcement, regs_str) in enumerate(results, start=1):
-        table_rows.append({
-            "S.No": serial,
-            "Company Name": company,
-            "Announcement_Type_From_PDF": announcement,
-            "Regulations_Cited": regs_str
-        })
-
-    df_table = pd.DataFrame(table_rows, columns=[
-        "S.No", "Company Name", "Announcement_Type_From_PDF", "Regulations_Cited"
-    ])
-
-    st.subheader("📑 Summaries (OpenAI)")
-    st.dataframe(df_table, use_container_width=True)
-
-    # CSV download
-    csv_bytes = df_table.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv_bytes,
-        file_name=f"bse_company_update_tags_{start_str}_{end_str}.csv",
-        mime="text/csv"
-    )
-
+    results = []  # will hold (idx, company, info_dict)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
+        for fut in as_completed(futs):
+            i, pdf_url, info, _ = fut.result()
+            r = rows[i][0]
+            company = str(r.get(nm) or "").strip()
+            # collect exactly what we need for the table
+            announcement = info.get("announcement_type_from_pdf", "Not disclosed")
+            regs = info.get("regulations_cited", ["Not disclosed"])
+            # regs may be list or string; render to one string for table
+            if isinstance(regs, list):
+                regs_str = "; ".join(str(x) for x in regs)
+            else:
+                regs_str = str(regs)
+            results.append((i, company, announcement, regs_str))
+    
+    # Sort by original index and assign S.No
+        results.sort(key=lambda x: x[0])
+        table_rows = []
+        for serial, (_, company, announcement, regs_str) in enumerate(results, start=1):
+            table_rows.append({
+                "S.No": serial,
+                "Company Name": company,
+                "Announcement_Type_From_PDF": announcement,
+                "Regulations_Cited": regs_str
+            })
+    
+        df_table = pd.DataFrame(table_rows, columns=[
+            "S.No", "Company Name", "Announcement_Type_From_PDF", "Regulations_Cited"
+        ])
+    
+        st.subheader("📑 Summaries (OpenAI)")
+        st.dataframe(df_table, use_container_width=True)
+    
+        # CSV download
+        csv_bytes = df_table.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name=f"bse_company_update_tags_{start_str}_{end_str}.csv",
+            mime="text/csv"
+        )
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
