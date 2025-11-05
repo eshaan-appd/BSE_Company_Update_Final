@@ -429,9 +429,7 @@ if run:
             dt = str(r.get("NEWS_DT") or "").strip()
             subcat = str(r.get(subcol) or "").strip()
             headline = str(r.get("HEADLINE") or "").strip()
-
-            with st.expander(f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}", expanded=False):
-                _render_bordered_table_from_json(summary, key="table")
+            _render_bordered_table_from_json(summary, key="table")
 
 else:
     st.info("Pick your date range and click **Fetch & Summarize with OpenAI**. This version uploads each PDF to OpenAI and renders the model’s summary right here.")
