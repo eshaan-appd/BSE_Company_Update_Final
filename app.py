@@ -206,42 +206,45 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
                               model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
                               temperature: float = 0.2) -> str:
+        """
+        Uses the Responses API with a file attachment. The model reads the PDF and returns a summary.
+        """
+        fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
+    
+        # NOTE: JSON braces in an f-string must be escaped as {{ and }}
+        task = f"""
+    You are a meticulous compliance analyst for Indian listed company filings.
+    Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
+    {{
+      "announcement_type_from_pdf": "<short type name from the filing or obvious from its contents>",
+      "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
+    }}
+    Rules:
+    - Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
+      'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
+    - If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
+    - If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
+    - Output ONLY the JSON, no prose.
+    
+    Context:
+    Company: {company or 'NA'}
+    Headline: {headline or 'NA'}
+    Subcategory: {subcat or 'NA'}
     """
-    Uses the Responses API with a file attachment. The model reads the PDF and returns a summary.
-    """
-    f = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
-
-    # Build a clear, deal-aware prompt but let the model do *all* reading/extraction.
-    task = f"""
-You are a meticulous compliance analyst for Indian listed company filings.
-Read the attached BSE/SEBI filing PDF and return STRICT JSON with keys:
-{
-  "announcement_type_from_pdf": "<short type name from the filing or obvious from its contents>",
-  "regulations_cited": ["<SEBI/LODR/PIT/etc citations exactly as written, minimal; if none, 'Not disclosed'>"]
-}
-Rules:
-- Use concise names for announcement type (e.g., 'Outcome of Board Meeting', 'Intimation of Board Meeting', 'Record Date', 'Dividend Declaration',
-  'Investor Presentation', 'Trading Window Closure', 'Credit Rating', 'Press Release', 'RPT Disclosure', 'Auditor Appointment', 'KMP change', 'Buyback', 'QIP/Preferential', etc.)
-- If the PDF explicitly cites regulations (e.g., 'Regulation 30 of SEBI (LODR) Regulations, 2015'), include them in regulations_cited (exact text; avoid duplicates).
-- If no clear regulation text is present, set regulations_cited to ['Not disclosed'].
-- Output ONLY the JSON, no prose.
-"""
-    # New Responses API supports file inputs alongside text. We attach the file and ask for a summary.
-    # Ref: Text generation guide & Responses API docs. The model parses the PDF server-side. 
-    resp = client.responses.create(
-        model=model,
-        temperature=temperature,
-        max_output_tokens=max_output_tokens,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": task},
-                {"type": "input_file", "file_id": f.id},
-            ],
-        }],
-    )
-    return (resp.output_text or "").strip()
-
+    
+        resp = client.responses.create(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": task},
+                    {"type": "input_file", "file_id": fobj.id},
+                ],
+            }],
+        )
+        return (resp.output_text or "").strip()
 # Simple rate-limit friendly wrapper
 def safe_summarize(*args, **kwargs) -> str:
     for i in range(4):
